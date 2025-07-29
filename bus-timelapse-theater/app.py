@@ -92,17 +92,23 @@ def main() -> None:
         "表示する路線を選択",
         options=list(route_options.keys()),
         format_func=lambda x: route_options[x],
-        default=['10025', '10026', '10016'] # デフォルトで指定の3路線を選択
+        default=['10025'] # デフォルトを10025のみに設定
     )
+
+    # 決定ボタンを追加
+    apply_filter_button = st.sidebar.button("決定")
+
+    # フィルタリングを適用するトリガー
+    # 初回ロード時、または決定ボタンが押された場合にフィルタリングを適用
+    if 'filtered_df' not in st.session_state or apply_filter_button:
+        st.session_state.filtered_df = df[df['route_id'].isin(selected_route_ids)]
+
+    df = st.session_state.filtered_df
 
     if not selected_route_ids:
         st.warning("路線を1つ以上選択してください。")
         st.stop()
 
-    # Filter the main dataframe by selected routes
-    # Ensure route_id in df is string type for consistent filtering
-    df['route_id'] = df['route_id'].astype(str)
-    df = df[df['route_id'].isin(selected_route_ids)]
     if df.empty:
         st.warning("選択された路線は、この日に運行データがありません。")
         return
