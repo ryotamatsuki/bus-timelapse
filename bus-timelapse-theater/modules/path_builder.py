@@ -1,3 +1,4 @@
+
 """
 Generate per‑trip position traces from GTFS timetable information.
 
@@ -161,7 +162,6 @@ def build_day_cache(
     # Group by trip_id
     for trip_id, group in stop_times.groupby("trip_id"):
         group = group.reset_index(drop=True)
-        print(f"DEBUG: Processing trip_id: {trip_id}, group length: {len(group)}")
         # iterate over consecutive stops
         for idx in range(len(group) - 1):
             row_a = group.iloc[idx]
@@ -169,16 +169,13 @@ def build_day_cache(
             # parse times
             t_a = hhmmss_to_sec(str(row_a["departure_time"]))
             t_b = hhmmss_to_sec(str(row_b["departure_time"]))
-            print(f"DEBUG:   Segment {idx}: t_a={t_a}, t_b={t_b}, stop_a={row_a['stop_id']}, stop_b={row_b['stop_id']}")
             # skip invalid or zero duration segments
             if t_b <= t_a:
-                print(f"DEBUG:     Skipping segment due to t_b <= t_a")
                 continue
             # coordinates
             coord_a = stop_coords.get(row_a["stop_id"])
             coord_b = stop_coords.get(row_b["stop_id"])
             if not coord_a or not coord_b:
-                print(f"DEBUG:     Skipping segment due to missing coordinates (stop_a: {row_a['stop_id']}, found: {bool(coord_a)}; stop_b: {row_b['stop_id']}, found: {bool(coord_b)})")
                 continue
             lat_a, lon_a = coord_a["stop_lat"], coord_a["stop_lon"]
             lat_b, lon_b = coord_b["stop_lat"], coord_b["stop_lon"]
@@ -192,9 +189,7 @@ def build_day_cache(
                 lon_b=lon_b,
                 step=5,
             )
-            print(f"DEBUG:     Interpolated {len(seg_records)} records for segment")
             records.extend(seg_records)
-    print(f"DEBUG: Final records count before DataFrame creation: {len(records)}")
 
     # Create DataFrame and join with trips to get route_id
     df = pd.DataFrame(records, columns=["trip_id", "timestamp", "lat", "lon"])

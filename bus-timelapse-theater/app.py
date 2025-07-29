@@ -71,7 +71,7 @@ def main() -> None:
     st.sidebar.info(f"表示日付: {fixed_date_str}")
 
     speed_option = st.sidebar.select_slider(
-        "再生速度 (秒ステップ)", options=[1, 5, 10, 25, 60], value=10
+        "再生速度 (秒ステップ)", options=[1, 5, 10, 25, 60], value=60
     )
     theme = st.sidebar.radio("地図テーマ", options=["Light", "Dark"], index=1)
 
@@ -84,7 +84,6 @@ def main() -> None:
         return
 
     # --- Route Selection UI ---
-    # 路線選択UIは残し、デフォルトで全路線を選択
     routes_df = pd.read_csv(os.path.join(gtfs_dir, "routes.txt"), dtype={'route_id': str})
     routes_df['display_name'] = routes_df['route_long_name'] + " (" + routes_df['route_short_name'].fillna('') + ")"
     route_options = routes_df.set_index('route_id')['display_name'].to_dict()
@@ -93,10 +92,8 @@ def main() -> None:
         "表示する路線を選択",
         options=list(route_options.keys()),
         format_func=lambda x: route_options[x],
-        default=list(route_options.keys()) # デフォルトで全路線を選択
+        default=['10025', '10026', '10016'] # デフォルトで指定の3路線を選択
     )
-
-    print(f"DEBUG: Selected Route IDs from UI: {selected_route_ids}")
 
     if not selected_route_ids:
         st.warning("路線を1つ以上選択してください。")
@@ -132,7 +129,7 @@ def main() -> None:
     h, m, s = current_time // 3600, (current_time % 3600) // 60, current_time % 60
     current_time_header.metric("現在時刻", f"{h:02d}:{m:02d}:{s:02d}")
 
-    auto_play = st.checkbox("自動再生", value=False)
+    auto_play = st.checkbox("自動再生", value=True) # デフォルトをTrueに変更
 
     layer = pdk.Layer(
         "TripsLayer",
@@ -167,10 +164,10 @@ def main() -> None:
             layer.current_time = ts
             h, m, s = ts // 3600, (ts % 3600) // 60, ts % 60
             current_time_header.metric("現在時刻", f"{h:02d}:{m:02d}:{s:02d}")
-            st.slider("時刻", min_value=min_ts, max_value=max_ts, value=ts, step=speed_option, disabled=True)
+            # st.slider("時刻", min_value=min_ts, max_value=max_ts, value=ts, step=speed_option, disabled=True) # 削除
             deck.layers = [layer]
             map_container.pydeck_chart(deck)
-            time.sleep(0.01)
+            time.sleep(0.001) # 高速化
         st.button("リセット")
 
 
