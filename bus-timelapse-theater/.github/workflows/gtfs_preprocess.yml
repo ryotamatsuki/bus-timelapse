@@ -1,0 +1,43 @@
+name: GTFS Preprocess
+
+on:
+  schedule:
+    # Run at 03:00 JST (18:00 UTC the previous day)
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+jobs:
+  build-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir -r requirements.txt
+
+      - name: Download latest GTFS
+        env:
+          ODPT_TOKEN: ${{ secrets.ODPT_TOKEN }}
+        run: |
+          # An environment variable containing the GTFS URL must be set
+          if [ -z "$ODPT_URL" ]; then
+            echo "ODPT_URL is not defined" && exit 1
+          fi
+          python scripts/download_gtfs.py --url "$ODPT_URL" --outdir data/gtfs
+
+      - name: Build tomorrow's cache
+        run: |
+          python -m modules.path_builder --date $(date -u -d "1 day" +%Y-%m-%d) --gtfs-dir data/gtfs/LATEST --cache-dir data/cache
+
+      - name: Upload cache artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache
+          path: data/cache

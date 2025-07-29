@@ -1,0 +1,2 @@
+feed_publisher_name,feed_publisher_url,feed_lang,feed_start_date,feed_end_date,feed_version
+伊予鉄バス株式会社,https://www.iyotetsu.co.jp/,ja,20250708,20250726,20250708_20250731

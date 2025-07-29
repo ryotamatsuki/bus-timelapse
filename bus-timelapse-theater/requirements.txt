@@ -1,0 +1,10 @@
+streamlit
+pandas
+pydeck
+pyarrow
+numpy
+tqdm
+black
+flake8
+isort
+requests
