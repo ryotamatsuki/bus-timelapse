@@ -14,6 +14,7 @@
 |------|------|------|
 | 基本 | 1 日分の全経路再生 / 再生 | 静的 GTFS のみで完結（リアルタイムデータなし） |
 | 任意 | A. Gemini によるナレーション機能<br>B. 動画エクスポート（MP4） | Gemini はテキスト生成のみ使用 |
+| 追加 | 路線選択機能 | ユーザーが特定の路線を選択して表示 |
 
 ## 3. ペルソナと想定ユースケース
 | ペルソナ | 行動シナリオ |
@@ -32,7 +33,7 @@ graph TD
     end
     FEATHER --> API[(Streamlit)]
     subgraph Streamlit
-        UI[Sidebar: 日付・速度
+        UI[Sidebar: 日付・速度・路線選択
 Main: Pydeck 3D 描画] --> PYDECK
         SLIDER[時刻スライダー] --> PYDECK
         PYDECK[TripsLayer でデータ描画]
@@ -64,26 +65,28 @@ Main: Pydeck 3D 描画] --> PYDECK
 | `stop_times.txt`                            | `trip_id`, `stop_sequence`      | `departure_time`, `stop_id`    |             |
 | `stops.txt`                                 | `stop_id`                       | `stop_lat`, `stop_lon`         |             |
 | `shapes.txt`                                | `shape_id`, `shape_pt_sequence` | `shape_pt_lat`, `shape_pt_lon` |             |
-| **キャッシュ** (`bus_trails_YYYY-MM-DD.feather`) | `trip_id`, `timestamp_sec`      | `lat`, `lon`                   | 5 秒毎の補間点を保存 |
+| **キャッシュ** (`bus_trails_YYYY-MM-DD.feather`) | `trip_id`, `timestamp_sec`      | `lat`, `lon`, `route_id`       | 5 秒毎の補間点を保存 |
 
 ### 時刻補間アルゴリズム
 
-1. 全バス停 A→B の **所要時間 Δt** を算出。
-2. `shapes.txt` で A→B 間の道のりに沿った **道のり比 r** を取得。
-3. `timestamp = t_A + r・Δt`、`lat/lon = A + r・(B−A)` を 5 s ピッチで線形補間。
-4. 全便（`trip_id`）について全時間帯を計算 → Feather 保存。
+1.  バス停 A→B の **所要時間 Δt** を算出。
+2.  `shapes.txt` で A→B 間の道のりに沿った **道のり比 r** を取得。
+3.  `timestamp = t_A + r・Δt`、`lat/lon = A + r・(B−A)` を 5 s ピッチで線形補間。
+4.  全便（`trip_id`）について全時間帯を計算 → Feather 保存。
 
 ## 6. 機能要件
 
 | 番号            | 機能            | 詳細                                               |
 | ------------- | ------------- | ------------------------------------------------ |
-| **F-01**      | 日付選択          | カレンダー UI。クリック時に対応キャッシュをロード（未キャッシュなら生成）         |
+| **F-01**      | 日付選択          | 固定日付（2025-07-15）を表示。データ提供範囲も明示。         |
 | **F-02**      | タイムスライダー      | 0〜86,400 s、1 s 刻み。`TripsLayer.current_time` に連動  |
-| **F-03**      | 3D 描画        | Pydeck `TripsLayer`、trail_length = 120 s、幅 2 px |
-| **F-04**      | 自動再生          | 再生/停止ボタン、10x / 25x 倍速切替                          |
+| **F-03**      | 3D 描画        | Pydeck `TripsLayer`、trail_length = 120 s、幅 2.5 px |
+| **F-04**      | 自動再生          | デフォルトで有効。高速化（1ステップ60秒、0.001秒間隔）。ループ再生。 |
 | **F-05**      | 地図テーマ         | ライト / ダーク map_style 切替                          |
 | **F-06 (任意)** | Gemini ナレーション | 選択時刻・場所に応じた 100 字コメント生成                           |
 | **F-07 (任意)** | MP4 エクスポート    | `deck.gl` screencast → FFMPEG 連携                 |
+| **F-08**      | 路線選択          | 複数路線を選択可能。デフォルトは「松山空港（道後温泉）」など3路線。 |
+| **F-09**      | 決定ボタン          | 路線選択の変更を明示的に地図に反映するボタン。             |
 
 ## 7. 非機能要件
 
@@ -95,20 +98,22 @@ Main: Pydeck 3D 描画] --> PYDECK
 | **スループット**  | 常時 20 セッションで FPS > 24                                        |
 | **コスト**     | Streamlit Community Cloud（無料枠）+ GitHub Actions 2,000 min/月以下 |
 | **ライセンス表記** | 画面フッターに「伊予鉄オープンデータ」とライセンス文言リンクを常時表示                            |
+| **パフォーマンス** | 路線選択機能により、描画データ量を削減し、パフォーマンスを向上。             |
+| **UI/UX**     | 時刻表示を「HH:MM:SS」形式に改善。決定ボタンにより、ユーザー操作の意図を明確化。 |
 
 ## 8. 外部インターフェース
 
 | IF              | 方式                     | 内容                                       |
 | --------------- | ---------------------- | ---------------------------------------- |
-| GTFS 取得         | HTTPS (ODPT CKAN API)  | ZIP ダウンロード URL + `wget`                  |
+| GTFS 擾         | HTTPS (ODPT CKAN API)  | ZIP ダウンロード URL + `wget`                  |
 | バッチ実行           | GitHub Actions (cron)  | Ubuntu-latest / Python 3.10              |
 | マップタイル           | deck.gl / Mapbox Style | OpenStreetMap タイル (token 不要の light/dark) |
 | Gemini API (任意) | HTTPS                  | text-generation (model: gemini-pro)      |
 
 ## 9. セキュリティ
 
-* 環境変数は **API キーを GitHub Secrets に格納**。
-* キャッシュファイルは公開リポジトリに含めず、GitHub Releases or LFS に格納。
+*   環境変数は **API キーを GitHub Secrets に格納**。
+*   キャッシュファイルは公開リポジトリに含めず、GitHub Releases or LFS に格納。
 
 ## 10. ワークフロー（WBS 概算）
 
@@ -137,25 +142,7 @@ Main: Pydeck 3D 描画] --> PYDECK
 
 ## 12. 最終デモシナリオ
 
-1. 任意の日付を選択し、**3 秒以内にタイムラプスが描画**されること。
-2. `trail_length` を変更しても、滑らかに再描画されること。
-3. F-04 自動再生で **0〜24 h を 60 秒以内に走破**し、クラッシュしないこと。
-4. README 手順通り `pip install -r requirements.txt` と `streamlit run app.py` で起動できること。
-
----
-
-### 開発を始めるための最初の一歩
-
-```bash
-# 1) テンプレート取得
-npx degit streamlit/example-app-template bus-timelapse
-cd bus-timelapse
-
-# 2) GTFS ダウンロード & 初期キャッシュ生成
-python modules/path_builder.py --date 2025-07-29
-
-# 3) 起動
-streamlit run app.py
-```
-
-**まずはローカルで 1 日分を再生し、滑らかに動く MVP を目指します。**
+1.  任意の日付を選択し、**3 秒以内にタイムラプスが描画**されること。
+2.  `trail_length` を変更しても、滑らかに再描画されること。
+3.  F-04 自動再生で **0〜24 h を 60 秒以内に走破**し、クラッシュしないこと。
+4.  README 手順通り `pip install -r requirements.txt` と `streamlit run app.py` で起動できること。
