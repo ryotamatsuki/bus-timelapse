@@ -1,0 +1,4 @@
+PS C:\Users\Owner\Desktop\workspace_new\proj_j_bus-timelapse-theater>  .\bus-timelapse-theater\.venv\Scripts\Activate.ps1
+(.venv) PS C:\Users\Owner\Desktop\workspace_new\proj_j_bus-timelapse-theater>
+
+streamlit run bus-timelapse-theater/app.py
