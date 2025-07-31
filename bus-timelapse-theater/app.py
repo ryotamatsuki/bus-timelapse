@@ -25,6 +25,7 @@ import time
 from datetime import date as date_type
 from datetime import datetime
 from functools import lru_cache
+from pathlib import Path
 from typing import Dict, List
 
 import numpy as np
@@ -61,7 +62,12 @@ def main() -> None:
     st.set_page_config(page_title="Ehime Bus Theater", layout="wide")
     st.title("Ehime Bus Time‑Lapse Theater")
 
-    gtfs_dir = "data/gtfs/2025-07-03"
+    # --- Path setup ---
+    # Get the directory of the current script
+    script_dir = Path(__file__).parent
+    # Set GTFS directory relative to the script directory
+    gtfs_dir = script_dir / "data" / "gtfs" / "2025-07-03"
+
     fixed_date_str = "2025-07-15" # 固定の日付
 
     # --- Sidebar controls ---
