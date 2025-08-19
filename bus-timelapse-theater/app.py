@@ -280,11 +280,32 @@ def main() -> None:
                             " (" + routes_df['route_short_name'].fillna('') + ")"
     route_options = routes_df.set_index('route_id')['display_name'].to_dict()
 
+    route_keys = list(route_options.keys())
+
+    # 初期選択を session_state で管理（既存デフォルトは '10025'）
+    if "route_selector" not in st.session_state:
+        st.session_state.route_selector = ['10025']
+
+    # 全選択 / 全解除 ボタン
+    c1, c2, c3 = st.sidebar.columns([1,1,1])
+    with c1:
+        if st.button("全て選択", use_container_width=True):
+            st.session_state.route_selector = route_keys[:]   # 全部
+    with c2:
+        if st.button("全て解除", use_container_width=True):
+            st.session_state.route_selector = []              # 空
+    with c3:
+        # お好みで：反転（要らなければこの列ごと削除可）
+        if st.button("反転", use_container_width=True):
+            cur = set(st.session_state.route_selector)
+            st.session_state.route_selector = [k for k in route_keys if k not in cur]
+
+    # multiselect は key で session_state と同期
     selected_route_ids = st.sidebar.multiselect(
         "表示する路線を選択",
-        options=list(route_options.keys()),
+        options=route_keys,
         format_func=lambda x: route_options[x],
-        default=['10025']
+        key="route_selector"
     )
 
     # --- Apply Filters and Process Data ---
