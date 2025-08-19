@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from string import Template # 追加
+from string import Template
 from typing import Dict, List
 
 import numpy as np
@@ -73,30 +73,66 @@ def drop_near_duplicates(df: pd.DataFrame, eps_m: float = 3.0) -> pd.DataFrame:
                 prev_row = row
     return df.loc[kept_indices].reset_index(drop=True)
 
+# 追加: カラーパレット（ColorBrewer系）
+PALETTE = [
+    [228,26,28],[55,126,184],[77,175,74],[152,78,163],[255,127,0],
+    [255,255,51],[166,86,40],[247,129,191],[153,153,153],[2,129,138]
+]
+
 @st.cache_data(show_spinner=False)
-def to_trips_payload(df: pd.DataFrame) -> list[dict]:
+def to_trips_payload(df: pd.DataFrame, route_colors: dict[str, list[int]]) -> list[dict]:
     trips = []
-    fixed_color = [253,128,93]
     for trip_id, g in df.groupby("trip_id", sort=False):
         g = g.sort_values("timestamp")
+        rid = g["route_id"].iloc[0]
         trips.append({
             "trip_id": trip_id,
-            "path": g[["lon","lat"]].to_numpy().tolist(),        # numpy→listで高速
+            "route_id": rid,  # ← 追加
+            "path": g[["lon","lat"]].to_numpy().tolist(),
             "timestamps": g["timestamp"].to_numpy(dtype=np.int32).tolist(),
-            "color": fixed_color
+            "color": route_colors[rid],  # ← ルート別の色
         })
     return trips
 
-def render_trips_in_browser(trips_data, view_state, map_style, min_ts, max_ts, step, trail_length=120, fps=24):
+def render_trips_in_browser(trips_data, routes_ui, view_state, map_style, min_ts, max_ts, step, trail_length=120, fps=24):
     html_tmpl = Template(r"""
-    <div id="deck-container" style="height: 80vh; width: 100%"></div>
+    <div id="map-wrap" style="position:relative;height:80vh;width:100%;">
+      <div id="deck-container" style="position:absolute;inset:0;"></div>
+
+      <!-- 固定凡例パネル（右上） -->
+      <div id="legend-panel" style="
+          position:absolute;top:12px;right:12px;z-index:10;
+          width:340px;max-height:70vh;overflow:auto;
+          background:rgba(255,255,255,0.92);backdrop-filter:saturate(1.2) blur(3px);
+          border:1px solid rgba(0,0,0,0.1); border-radius:10px; box-shadow:0 4px 16px rgba(0,0,0,0.15);
+          font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color:#222;">
+        <div style="display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid rgba(0,0,0,0.06);">
+          <strong style="font-size:14px;">路線フィルタ</strong>
+          <div style="margin-left:auto;display:flex;gap:6px;">
+            <button id="btn-all"  style="padding:4px 8px;border:1px solid #ddd;border-radius:6px;background:#f7f7f7;cursor:pointer;">すべてON</button>
+            <button id="btn-none" style="padding:4px 8px;border:1px solid #ddd;border-radius:6px;background:#f7f7f7;cursor:pointer;">すべてOFF</button>
+          </div>
+        </div>
+        <div style="padding:10px 12px;border-bottom:1px solid rgba(0,0,0,0.06);display:flex;gap:8px;">
+          <input id="route-search" type="search" placeholder="路線名やIDで検索" 
+                 style="flex:1;padding:6px 8px;border:1px solid #ddd;border-radius:6px;"/>
+        </div>
+        <div id="route-list" style="padding:8px 12px;display:flex;flex-direction:column;gap:6px;"></div>
+        <div id="legend-footer" style="padding:8px 12px;border-top:1px solid rgba(0,0,0,0.06);font-size:12px;color:#555;">
+          <span id="count"></span>
+        </div>
+      </div>
+    </div>
+
     <script src="https://unpkg.com/deck.gl@8.9.27/dist.min.js"></script>
     <script src="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.js"></script>
     <link href="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.css" rel="stylesheet"/>
 
     <script>
-      const trips = $TRIPS;             // 事前にJSON化して挿入
-      const initialViewState = $VIEW;   // 同上
+      // データ
+      const trips = $TRIPS;     // [{trip_id, route_id, path, timestamps, color}]
+      const routes = $ROUTES;   // [{route_id, name, color}]
+      const initialViewState = $VIEW;
       const MIN_TS = $MIN_TS;
       const MAX_TS = $MAX_TS;
       let   STEP   = $STEP;
@@ -106,17 +142,74 @@ def render_trips_in_browser(trips_data, view_state, map_style, min_ts, max_ts, s
       const deckgl = new deck.DeckGL({
         container: 'deck-container',
         controller: true,
-        initialViewState: initialViewState,
-        map: maplibregl,  // MapLibre を使う
+        initialViewState,
+        map: maplibregl,
         mapStyle: "$MAP_STYLE"
       });
 
+      // 状態：有効化されたroute_id集合（初期は全ON）
+      let enabled = new Set(routes.map(r => r.route_id));
       let currentTime = MIN_TS;
+      let filteredRoutes = routes.slice(); // 検索後の表示対象
 
-      function makeLayer(ct) {
+      // UI構築
+      const listEl = document.getElementById('route-list');
+      const searchEl = document.getElementById('route-search');
+      const countEl = document.getElementById('count');
+
+      function renderList() {
+        listEl.innerHTML = '';
+        filteredRoutes.forEach(r => {
+          const id = 'route-' + r.route_id;
+          const row = document.createElement('label');
+          row.style.display = 'flex';
+          row.style.alignItems = 'center';
+          row.style.gap = '8px';
+          row.style.cursor = 'pointer';
+          row.innerHTML = `
+            <input type="checkbox" id="${id}" ${enabled.has(r.route_id) ? 'checked' : ''} />
+            <span style="width:12px;height:12px;border-radius:2px;display:inline-block;background:rgb(${r.color.join(',')});"></span>
+            <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${r.name}">${r.name}</span>
+            <span style="margin-left:auto;color:#999;font-size:11px;">${r.route_id}</span>
+          `;
+          listEl.appendChild(row);
+          row.querySelector('input').addEventListener('change', (e) => {
+            if (e.target.checked) enabled.add(r.route_id); else enabled.delete(r.route_id);
+            updateVisibleTrips();
+          });
+        });
+        updateCount();
+      }
+
+      function updateCount() {
+        countEl.textContent = `選択 ${enabled.size} / 総数 ${routes.length}` +
+          (filteredRoutes.length !== routes.length ? `（表示中 ${filteredRoutes.length}）` : '');
+      }
+
+      function doSearch(text) {
+        const q = (text || '').trim().toLowerCase();
+        filteredRoutes = routes.filter(r =>
+          !q || r.name.toLowerCase().includes(q) || String(r.route_id).toLowerCase().includes(q)
+        );
+        renderList();
+      }
+
+      document.getElementById('btn-all').addEventListener('click', () => {
+        filteredRoutes.forEach(r => enabled.add(r.route_id));  // 表示中（=検索結果）だけON
+        renderList();
+        updateVisibleTrips();
+      });
+      document.getElementById('btn-none').addEventListener('click', () => {
+        filteredRoutes.forEach(r => enabled.delete(r.route_id)); // 表示中だけOFF
+        renderList();
+        updateVisibleTrips();
+      });
+      searchEl.addEventListener('input', (e) => doSearch(e.target.value));
+
+      function makeLayer(ct, data) {
         return new deck.TripsLayer({
           id: 'trips',
-          data: trips,
+          data,
           getPath: d => d.path,
           getTimestamps: d => d.timestamps,
           getColor: d => d.color,
@@ -127,19 +220,27 @@ def render_trips_in_browser(trips_data, view_state, map_style, min_ts, max_ts, s
         });
       }
 
-      deckgl.setProps({ layers: [makeLayer(currentTime)] });
-
-      function tick() {
-        currentTime += STEP;
-        if (currentTime > MAX_TS) currentTime = MIN_TS; // Loop
-        deckgl.setProps({ layers: [makeLayer(currentTime)] });
+      function updateVisibleTrips() {
+        const visibleTrips = trips.filter(t => enabled.has(t.route_id));
+        deckgl.setProps({ layers: [makeLayer(currentTime, visibleTrips)] });
       }
 
-      setInterval(tick, Math.max(1, Math.floor(1000 / FPS))); // Python往復なし
+      // 初期描画
+      doSearch('');        // 一覧生成
+      updateVisibleTrips();
+
+      // アニメーション
+      function tick() {
+        currentTime += STEP;
+        if (currentTime > MAX_TS) currentTime = MIN_TS;
+        updateVisibleTrips();
+      }
+      setInterval(tick, Math.max(1, Math.floor(1000 / FPS)));
     </script>
     """)
-    html = html_tmpl.substitute(
+    html = html_tmpl.safe_substitute(
         TRIPS=json.dumps(trips_data, separators=(',', ':')),
+        ROUTES=json.dumps(routes_ui, separators=(',', ':')),
         VIEW=json.dumps(view_state, separators=(',', ':')),
         MIN_TS=min_ts, MAX_TS=max_ts, STEP=step, FPS=fps, TRAIL=trail_length,
         MAP_STYLE=map_style
@@ -207,8 +308,17 @@ def main() -> None:
     processed_df["lon"] = processed_df["lon"].round(5)
     processed_df["timestamp"] = processed_df["timestamp"].astype(np.int32)
 
-    # 4) Trips化
-    trips_data = to_trips_payload(processed_df)
+    # 4) Trips化（ルート別カラー割当）
+    uniq_routes = list(pd.unique(processed_df["route_id"]))
+    route_colors = {rid: PALETTE[i % len(PALETTE)] for i, rid in enumerate(uniq_routes)}
+
+    # 凡例/UI用メタ
+    routes_ui = [
+        {"route_id": rid, "name": route_options.get(rid, rid), "color": route_colors[rid]}
+        for rid in uniq_routes
+    ]
+
+    trips_data = to_trips_payload(processed_df, route_colors)
 
     if trips_data:
         lat_center, lon_center = float(processed_df["lat"].mean()), float(processed_df["lon"].mean())
@@ -231,6 +341,7 @@ def main() -> None:
 
     render_trips_in_browser(
         trips_data=trips_data,
+        routes_ui=routes_ui,          # ← 追加
         view_state=view_state,
         map_style=map_style,
         min_ts=min_ts, max_ts=max_ts,
