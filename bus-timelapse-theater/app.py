@@ -214,7 +214,8 @@ def render_trips_in_browser(
     trips_data, routes_ui, view_state, map_style,
     min_ts, max_ts, step, trail_length=120, fps=24,
     stops_data=None, show_labels=False, stop_size_px=6,
-    edges_data=None, show_edges=True, line_width_px=3
+    edges_data=None, show_edges=True, line_width_px=3,
+    trip_width_px=4, trail_opacity=220, edge_opacity=140
 ):
     stops_data = stops_data or []
     edges_data = edges_data or []
@@ -248,8 +249,11 @@ def render_trips_in_browser(
       const SHOW_LABELS = $SHOW_LABELS;
       const STOP_SIZE   = $STOP_SIZE;
 
-      const SHOW_EDGES = $SHOW_EDGES; // ← 追加
-      const LINE_WIDTH = $LINE_WIDTH; // ← 追加
+      const SHOW_EDGES = $SHOW_EDGES;
+      const LINE_WIDTH = $LINE_WIDTH;
+      const TRIP_WIDTH = $TRIP_WIDTH;     // ← 追加
+      const TRAIL_ALPHA = $TRAIL_ALPHA;   // ← 追加
+      const EDGE_ALPHA  = $EDGE_ALPHA;    // ← 追加
 
       const deckgl = new deck.DeckGL({
         container: 'deck-container',
@@ -280,20 +284,46 @@ def render_trips_in_browser(
 
       function makeLayers(ct, visibleTrips) {
         const routeColorMap = Object.fromEntries(routes.map(r => [String(r.route_id), r.color]));
+        const addAlpha = (rgb, a) => (rgb && rgb.length >= 3) ? [rgb[0], rgb[1], rgb[2], a] : [80,80,80,a];
         const layers = [];
 
+        // --- 1) 停留所間ライン：下敷きに描画 ---
+        if (SHOW_EDGES && edges.length > 0) {
+          const visibleEdges = edges.filter(e => e.routes.some(rid => enabled.has(String(rid))));
+          const pickColor = (routesOfEdge) => {
+            for (const rid of routesOfEdge) {
+              const k = String(rid);
+              if (enabled.has(k) && routeColorMap[k]) return addAlpha(routeColorMap[k], EDGE_ALPHA);
+            }
+            const k0 = String(routesOfEdge[0] || "");
+            return addAlpha(routeColorMap[k0] || [80,80,80], EDGE_ALPHA);
+          };
+          layers.push(new deck.PathLayer({
+            id: 'route-edges',
+            data: visibleEdges,
+            getPath: d => d.path,
+            getColor: d => pickColor(d.routes),
+            widthUnits: 'pixels',
+            getWidth: d => LINE_WIDTH,
+            parameters: { depthTest: false },
+            pickable: true
+          }));
+        }
+
+        // --- 2) バス軌跡（アニメーション）：上に描画 ---
         layers.push(new deck.TripsLayer({
           id: 'trips',
           data: visibleTrips,
           getPath: d => d.path,
           getTimestamps: d => d.timestamps,
-          getColor: d => d.color,
-          widthMinPixels: 2.5,
+          getColor: d => addAlpha(d.color, TRAIL_ALPHA),
+          widthMinPixels: TRIP_WIDTH,     // ← 太さをスライダで
           trailLength: TRAIL,
           currentTime: ct,
           pickable: true
         }));
 
+        // --- 3) 停留所ポイント ---
         if (stops.length > 0) {
           layers.push(new deck.ScatterplotLayer({
             id: 'stops',
@@ -312,55 +342,25 @@ def render_trips_in_browser(
         }
 
         if (SHOW_LABELS && stops.length > 0) {
-          // JS内どこか（deckgl 初期化後でOK）：停留所名から文字集合を作る
           const CHARSET = Array.from(new Set(stops.map(d => d.name).join('')));
-
           layers.push(new deck.TextLayer({
             id: 'stop-labels',
             data: stops,
             getPosition: d => d.coord,
             getText: d => d.name,
-            getSize: d => 14,  // px固定。好みで 12〜16
+            getSize: d => 14,
             sizeUnits: 'pixels',
             sizeScale: 1,
             fontFamily: 'Noto Sans JP, "Yu Gothic UI", Meiryo, "Hiragino Kaku Gothic ProN", sans-serif',
             characterSet: CHARSET,
             background: true,
-            getBackgroundColor: [255, 255, 255, 220],
+            getBackgroundColor: [255,255,255,220],
             getColor: [20, 20, 20, 255],
             getTextAnchor: 'start',
             getAlignmentBaseline: 'center',
             billboard: true,
             pickable: false,
-            parameters: { depthTest: false }   // タイルや線の下に潜らない
-          }));
-        }
-
-        // 停留所間ライン（無向ペアの重複は Python 側で排除済）
-        if (SHOW_EDGES && edges.length > 0) {
-          // フィルタ：有効な路線（enabled）を1つ以上含むエッジのみ
-          const visibleEdges = edges.filter(e => e.routes.some(rid => enabled.has(String(rid))));
-
-          // 色決定：そのエッジで "enabled な最初の route_id" の色を使う（軌跡色と一致）
-          const pickColor = (routesOfEdge) => {
-            for (const rid of routesOfEdge) {
-              const k = String(rid);
-              if (enabled.has(k) && routeColorMap[k]) return routeColorMap[k];
-            }
-            // 予備：全て無効なら先頭の色かデフォルト
-            const k0 = String(routesOfEdge[0] || "");
-            return routeColorMap[k0] || [80,80,80];
-          };
-
-          layers.push(new deck.PathLayer({
-            id: 'route-edges',
-            data: visibleEdges,
-            getPath: d => d.path,
-            getColor: d => pickColor(d.routes),
-            widthUnits: 'pixels',
-            getWidth: d => LINE_WIDTH,
-            parameters: { depthTest: false },
-            pickable: true
+            parameters: { depthTest: false }
           }));
         }
 
@@ -394,14 +394,17 @@ def render_trips_in_browser(
         TRIPS=json.dumps(trips_data, separators=(',', ':')),
         ROUTES=json.dumps(routes_ui, separators=(',', ':')),
         STOPS=json.dumps(stops_data, separators=(',', ':')),
-        EDGES=json.dumps(edges_data, separators=(',', ':')),   # ← 追加
+        EDGES=json.dumps(edges_data, separators=(',', ':')),
         VIEW=json.dumps(view_state, separators=(',', ':')),
         MIN_TS=min_ts, MAX_TS=max_ts, STEP=step, FPS=fps, TRAIL=trail_length,
         MAP_STYLE=map_style,
         SHOW_LABELS=json.dumps(bool(show_labels)),
         STOP_SIZE=int(stop_size_px),
-        SHOW_EDGES=json.dumps(bool(show_edges)),               # ← 追加
-        LINE_WIDTH=int(line_width_px),                         # ← 追加
+        SHOW_EDGES=json.dumps(bool(show_edges)),
+        LINE_WIDTH=int(line_width_px),
+        TRIP_WIDTH=int(trip_width_px),        # ← 追加
+        TRAIL_ALPHA=int(trail_opacity),       # ← 追加
+        EDGE_ALPHA=int(edge_opacity),         # ← 追加
     )
     components.html(html, height=720)
 
@@ -444,6 +447,16 @@ def main() -> None:
     st.sidebar.subheader("路線ライン")
     show_edges = st.sidebar.checkbox("停留所間ラインを表示", value=True)
     line_width_px = st.sidebar.slider("ライン太さ（px）", 1, 8, 3)
+
+    # バスの軌跡（TripsLayer）の太さ＆不透明度
+    st.sidebar.subheader("バスの軌跡（アニメーション）")
+    trip_width_px = st.sidebar.slider(
+        "軌跡の太さ（px）", 1, 16, max(line_width_px + 1, 4)  # ← ラインより常に少し太く
+    )
+    trail_opacity = st.sidebar.slider("軌跡の不透明度 (0-255)", 50, 255, 220)
+
+    # ラインの不透明度
+    edge_opacity = st.sidebar.slider("ラインの不透明度 (0-255)", 20, 255, 140)
 
 
     # --- Data Loading ---
@@ -567,9 +580,12 @@ def main() -> None:
         stops_data=stops_data,
         show_labels=show_labels,
         stop_size_px=stop_size_px,
-        edges_data=edges_data,           # ← 追加
-        show_edges=show_edges,           # ← 追加
-        line_width_px=line_width_px      # ← 追加
+        edges_data=edges_data,
+        show_edges=show_edges,
+        line_width_px=line_width_px,
+        trip_width_px=trip_width_px,        # ← 追加
+        trail_opacity=trail_opacity,        # ← 追加
+        edge_opacity=edge_opacity           # ← 追加
     )
 
 if __name__ == "__main__":
