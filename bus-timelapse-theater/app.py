@@ -46,6 +46,27 @@ def load_routes(gtfs_dir: str) -> pd.DataFrame:
     routes_path = (Path(gtfs_dir) / "routes.txt")
     return pd.read_csv(routes_path, dtype={'route_id': str})
 
+# --- Stops Loading ---
+@st.cache_data(show_spinner=False)
+def load_stops(gtfs_dir: str) -> pd.DataFrame:
+    stops_path = Path(gtfs_dir) / "stops.txt"
+    df = pd.read_csv(stops_path, dtype={"stop_id": str})
+    df = df.rename(columns={"stop_lat": "lat", "stop_lon": "lon"})
+    df = df[["stop_id", "stop_name", "lat", "lon"]].dropna(subset=["lat", "lon"])
+    # 近い点の重複を抑えるため軽く丸め（見た目・描画負荷対策）
+    df["lat"] = df["lat"].round(5)
+    df["lon"] = df["lon"].round(5)
+    return df
+
+@st.cache_data(show_spinner=False)
+def to_stops_payload(df: pd.DataFrame) -> list[dict]:
+    # deck.gl に渡す JSON（lon,lat の順に注意）
+    return [
+        {"stop_id": r.stop_id, "name": str(r.stop_name), "coord": [float(r.lon), float(r.lat)]}
+        for r in df.itertuples(index=False)
+    ]
+
+
 def thin_by_time(df: pd.DataFrame, step_sec: int) -> pd.DataFrame:
     # 各 trip 内で相対時刻に変換して % step == 0 の行だけ残す
     df = df.sort_values(["trip_id", "timestamp"])
@@ -94,36 +115,21 @@ def to_trips_payload(df: pd.DataFrame, route_colors: dict[str, list[int]]) -> li
         })
     return trips
 
-def render_trips_in_browser(trips_data, routes_ui, view_state, map_style, min_ts, max_ts, step, trail_length=120, fps=24):
+def render_trips_in_browser(
+    trips_data, routes_ui, view_state, map_style,
+    min_ts, max_ts, step, trail_length=120, fps=24,
+    stops_data=None, show_labels=False, stop_size_px=6
+):
+    stops_data = stops_data or []
     html_tmpl = Template(r"""
     <div id="map-wrap" style="position:relative;height:80vh;width:100%;">
       <div id="deck-container" style="position:absolute;inset:0;"></div>
-
-      <!-- 固定凡例パネル（右上） -->
-      <div id="legend-panel" style="
-          position:absolute;top:12px;right:12px;z-index:10;
-          width:340px;max-height:70vh;overflow:auto;
-          background:rgba(255,255,255,0.92);backdrop-filter:saturate(1.2) blur(3px);
-          border:1px solid rgba(0,0,0,0.1); border-radius:10px; box-shadow:0 4px 16px rgba(0,0,0,0.15);
-          font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color:#222;">
-        <div style="display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid rgba(0,0,0,0.06);">
-          <strong style="font-size:14px;">路線フィルタ</strong>
-          <div style="margin-left:auto;display:flex;gap:6px;">
-            <button id="btn-all"  style="padding:4px 8px;border:1px solid #ddd;border-radius:6px;background:#f7f7f7;cursor:pointer;">すべてON</button>
-            <button id="btn-none" style="padding:4px 8px;border:1px solid #ddd;border-radius:6px;background:#f7f7f7;cursor:pointer;">すべてOFF</button>
-          </div>
-        </div>
-        <div style="padding:10px 12px;border-bottom:1px solid rgba(0,0,0,0.06);display:flex;gap:8px;">
-          <input id="route-search" type="search" placeholder="路線名やIDで検索" 
-                 style="flex:1;padding:6px 8px;border:1px solid #ddd;border-radius:6px;"/>
-        </div>
-        <div id="route-list" style="padding:8px 12px;display:flex;flex-direction:column;gap:6px;"></div>
-        <div id="legend-footer" style="padding:8px 12px;border-top:1px solid rgba(0,0,0,0.06);font-size:12px;color:#555;">
-          <span id="count"></span>
-        </div>
-      </div>
     </div>
 
+    <!-- 日本語フォントを iframe 側に読み込む（重要）-->
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700&display=swap" rel="stylesheet">
+
+    <!-- ✅ 空白を削除した正しい CDN URL -->
     <script src="https://unpkg.com/deck.gl@8.9.27/dist.min.js"></script>
     <script src="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.js"></script>
     <link href="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.css" rel="stylesheet"/>
@@ -132,102 +138,113 @@ def render_trips_in_browser(trips_data, routes_ui, view_state, map_style, min_ts
       // データ
       const trips = $TRIPS;     // [{trip_id, route_id, path, timestamps, color}]
       const routes = $ROUTES;   // [{route_id, name, color}]
+      const stops  = $STOPS;    // [{stop_id, name, coord:[lon,lat]}]
       const initialViewState = $VIEW;
+
       const MIN_TS = $MIN_TS;
       const MAX_TS = $MAX_TS;
       let   STEP   = $STEP;
       let   FPS    = $FPS;
       const TRAIL  = $TRAIL;
 
+      const SHOW_LABELS = $SHOW_LABELS;
+      const STOP_SIZE   = $STOP_SIZE;
+
       const deckgl = new deck.DeckGL({
         container: 'deck-container',
         controller: true,
         initialViewState,
         map: maplibregl,
-        mapStyle: "$MAP_STYLE"
+        mapStyle: "$MAP_STYLE",
+        getTooltip: ({object, layer}) => {
+          if (!object || !layer) return null;
+          if (layer.id === 'stops') {
+            // ✅ Template と衝突しない通常の連結
+            return {text: object.name + " (" + object.stop_id + ")"};
+          }
+          if (layer.id === 'trips') {
+            return {text: "route: " + object.route_id};
+          }
+          return null;
+        }
       });
 
-      // 状態：有効化されたroute_id集合（初期は全ON）
+      // 状態：有効化された route_id 集合（初期は全ON）
       let enabled = new Set(routes.map(r => r.route_id));
       let currentTime = MIN_TS;
-      let filteredRoutes = routes.slice(); // 検索後の表示対象
 
-      // UI構築
-      const listEl = document.getElementById('route-list');
-      const searchEl = document.getElementById('route-search');
-      const countEl = document.getElementById('count');
+      function makeLayers(ct, visibleTrips) {
+        const layers = [];
 
-      function renderList() {
-        listEl.innerHTML = '';
-        filteredRoutes.forEach(r => {
-          const id = 'route-' + r.route_id;
-          const row = document.createElement('label');
-          row.style.display = 'flex';
-          row.style.alignItems = 'center';
-          row.style.gap = '8px';
-          row.style.cursor = 'pointer';
-          row.innerHTML = `
-            <input type="checkbox" id="${id}" ${enabled.has(r.route_id) ? 'checked' : ''} />
-            <span style="width:12px;height:12px;border-radius:2px;display:inline-block;background:rgb(${r.color.join(',')});"></span>
-            <span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${r.name}">${r.name}</span>
-            <span style="margin-left:auto;color:#999;font-size:11px;">${r.route_id}</span>
-          `;
-          listEl.appendChild(row);
-          row.querySelector('input').addEventListener('change', (e) => {
-            if (e.target.checked) enabled.add(r.route_id); else enabled.delete(r.route_id);
-            updateVisibleTrips();
-          });
-        });
-        updateCount();
-      }
-
-      function updateCount() {
-        countEl.textContent = `選択 ${enabled.size} / 総数 ${routes.length}` +
-          (filteredRoutes.length !== routes.length ? `（表示中 ${filteredRoutes.length}）` : '');
-      }
-
-      function doSearch(text) {
-        const q = (text || '').trim().toLowerCase();
-        filteredRoutes = routes.filter(r =>
-          !q || r.name.toLowerCase().includes(q) || String(r.route_id).toLowerCase().includes(q)
-        );
-        renderList();
-      }
-
-      document.getElementById('btn-all').addEventListener('click', () => {
-        filteredRoutes.forEach(r => enabled.add(r.route_id));  // 表示中（=検索結果）だけON
-        renderList();
-        updateVisibleTrips();
-      });
-      document.getElementById('btn-none').addEventListener('click', () => {
-        filteredRoutes.forEach(r => enabled.delete(r.route_id)); // 表示中だけOFF
-        renderList();
-        updateVisibleTrips();
-      });
-      searchEl.addEventListener('input', (e) => doSearch(e.target.value));
-
-      function makeLayer(ct, data) {
-        return new deck.TripsLayer({
+        layers.push(new deck.TripsLayer({
           id: 'trips',
-          data,
+          data: visibleTrips,
           getPath: d => d.path,
           getTimestamps: d => d.timestamps,
           getColor: d => d.color,
           widthMinPixels: 2.5,
           trailLength: TRAIL,
           currentTime: ct,
-          pickable: false
-        });
+          pickable: true
+        }));
+
+        if (stops.length > 0) {
+          layers.push(new deck.ScatterplotLayer({
+            id: 'stops',
+            data: stops,
+            getPosition: d => d.coord,
+            getRadius: d => 1,
+            radiusMinPixels: STOP_SIZE,
+            radiusMaxPixels: STOP_SIZE,
+            stroked: true,
+            filled: true,
+            getFillColor: [0, 0, 0, 200],
+            getLineColor: [255, 255, 255, 220],
+            lineWidthMinPixels: 1,
+            pickable: true
+          }));
+        }
+
+        if (SHOW_LABELS && stops.length > 0) {
+          // JS内どこか（deckgl 初期化後でOK）：停留所名から文字集合を作る
+          const CHARSET = Array.from(new Set(stops.map(d => d.name).join('')));
+
+          layers.push(new deck.TextLayer({
+            id: 'stop-labels',
+            data: stops,
+            getPosition: d => d.coord,
+            getText: d => d.name,
+            getSize: d => 14,  // px固定。好みで 12〜16
+            sizeUnits: 'pixels',
+            sizeScale: 1,
+            fontFamily: 'Noto Sans JP, "Yu Gothic UI", Meiryo, "Hiragino Kaku Gothic ProN", sans-serif',
+            characterSet: CHARSET,
+            background: true,
+            getBackgroundColor: [255, 255, 255, 220],
+            getColor: [20, 20, 20, 255],
+            getTextAnchor: 'start',
+            getAlignmentBaseline: 'center',
+            billboard: true,
+            pickable: false,
+            parameters: { depthTest: false }   // タイルや線の下に潜らない
+          }));
+        }
+
+        return layers;
       }
 
       function updateVisibleTrips() {
         const visibleTrips = trips.filter(t => enabled.has(t.route_id));
-        deckgl.setProps({ layers: [makeLayer(currentTime, visibleTrips)] });
+        deckgl.setProps({ layers: makeLayers(currentTime, visibleTrips) });
       }
 
       // 初期描画
-      doSearch('');        // 一覧生成
       updateVisibleTrips();
+
+      // フォント読込完了後にレイヤを再設定
+      if (document.fonts && document.fonts.ready) {
+        document.fonts.ready.then(() => updateVisibleTrips());
+      }
 
       // アニメーション
       function tick() {
@@ -237,25 +254,49 @@ def render_trips_in_browser(trips_data, routes_ui, view_state, map_style, min_ts
       }
       setInterval(tick, Math.max(1, Math.floor(1000 / FPS)));
     </script>
-    """)
+    """);
+
     html = html_tmpl.safe_substitute(
         TRIPS=json.dumps(trips_data, separators=(',', ':')),
         ROUTES=json.dumps(routes_ui, separators=(',', ':')),
+        STOPS=json.dumps(stops_data, separators=(',', ':')),
         VIEW=json.dumps(view_state, separators=(',', ':')),
         MIN_TS=min_ts, MAX_TS=max_ts, STEP=step, FPS=fps, TRAIL=trail_length,
-        MAP_STYLE=map_style
+        MAP_STYLE=map_style,
+        SHOW_LABELS=json.dumps(bool(show_labels)),
+        STOP_SIZE=int(stop_size_px),
     )
     components.html(html, height=720)
 
 
 def main() -> None:
-    st.set_page_config(page_title="Ehime Bus Theater", layout="wide")
+    st.set_page_config(layout="wide")
+    
     st.title("Ehime Bus Time‑Lapse Theater")
 
     # --- Path and Date Setup ---
     script_dir = Path(__file__).parent
-    gtfs_dir = script_dir / "data" / "gtfs" / "2025-07-03"
+
+    # まずは Windows 絶対パスを優先（raw 文字列にしておく）
+    abs_gtfs_dir = Path(r"C:\Users\Owner\Desktop\workspace_new\proj_j_bus-timelapse-theater\data\AllLines-20250703")
+
+    candidates = [
+        abs_gtfs_dir,
+        script_dir / "data" / "gtfs" / "2025-07-03",
+    ]
+
+    gtfs_dir = None
+    for p in candidates:
+        if (p / "stops.txt").exists() and (p / "routes.txt").exists():
+            gtfs_dir = p
+            break
+
+    if gtfs_dir is None:
+        st.error("GTFS データ（stops.txt, routes.txt）が見つかりません。パス設定を確認してください。")
+        st.stop()
+
     fixed_date_str = "2025-07-15"
+
 
     # --- Sidebar Controls ---
     st.sidebar.header("表示設定")
@@ -266,6 +307,13 @@ def main() -> None:
     )
     theme = st.sidebar.radio("地図テーマ", options=["Light", "Dark"], index=1)
 
+    # バス停表示の追加オプション
+    st.sidebar.subheader("バス停の表示")
+    show_stops = st.sidebar.checkbox("バス停ポイントを表示", value=True)
+    show_labels = st.sidebar.checkbox("バス停名ラベルを表示（高ズーム推奨）", value=False)
+    stop_size_px = st.sidebar.slider("バス停サイズ（px）", min_value=3, max_value=12, value=6)
+
+
     # --- Data Loading ---
     with st.spinner(f"{fixed_date_str} のキャッシュデータを生成・読込中..."):
         df = _load_cache(fixed_date_str, gtfs_dir)
@@ -274,13 +322,15 @@ def main() -> None:
         st.warning("選択した日に運行するサービスはありません。")
         st.stop()
 
-    # --- Route Selection ---
+    # ルート情報は既存のまま
     routes_df = load_routes(gtfs_dir)
-    routes_df['display_name'] = routes_df['route_long_name'].fillna('') + \
-                            " (" + routes_df['route_short_name'].fillna('') + ")"
+    routes_df['display_name'] = routes_df['route_long_name'].fillna('') + " (" + routes_df['route_short_name'].fillna('') + ")"
     route_options = routes_df.set_index('route_id')['display_name'].to_dict()
+    all_route_ids = list(route_options.keys())
 
-    route_keys = list(route_options.keys())
+    # （前回提案の全選択/全解除 UI はそのまま利用）
+    # --- Route Selection ---
+    route_keys = all_route_ids
 
     # 初期選択を session_state で管理（既存デフォルトは '10025'）
     if "route_selector" not in st.session_state:
@@ -307,6 +357,14 @@ def main() -> None:
         format_func=lambda x: route_options[x],
         key="route_selector"
     )
+
+
+    # バス停
+    stops_data = []
+    if show_stops:
+        stops_df = load_stops(gtfs_dir)
+        stops_data = to_stops_payload(stops_df)
+
 
     # --- Apply Filters and Process Data ---
     if not selected_route_ids:
@@ -351,10 +409,10 @@ def main() -> None:
 
     # --- Deck.gl Rendering (Browser-side Animation) ---
     view_state = dict(latitude=lat_center, longitude=lon_center, zoom=12, pitch=45, bearing=0)
-    map_style = (\
-        "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"\
-        if theme == "Light" else\
-        "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"\
+    map_style = (
+        "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
+        if theme == "Light" else
+        "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
     )
     
     # レイヤ設定の実務的チューニング
@@ -362,13 +420,16 @@ def main() -> None:
 
     render_trips_in_browser(
         trips_data=trips_data,
-        routes_ui=routes_ui,          # ← 追加
+        routes_ui=routes_ui,
         view_state=view_state,
         map_style=map_style,
         min_ts=min_ts, max_ts=max_ts,
         step=speed_option,
         trail_length=trail_length_tuned,
-        fps=24 # 固定FPS
+        fps=24,
+        stops_data=stops_data,          # ← 追加
+        show_labels=show_labels,        # ← 追加
+        stop_size_px=stop_size_px       # ← 追加
     )
 
 if __name__ == "__main__":
