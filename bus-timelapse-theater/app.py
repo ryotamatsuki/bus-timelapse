@@ -41,10 +41,48 @@ def _load_cache(date_str: str, gtfs_dir: str) -> pd.DataFrame:
     return build_day_cache(date_str, gtfs_dir=str(gtfs_dir))
 
 @st.cache_data(show_spinner=False)
+def load_trips(gtfs_dir: str) -> pd.DataFrame:
+    p = Path(gtfs_dir) / "trips.txt"
+    return pd.read_csv(p, dtype={"trip_id": str, "route_id": str})[["trip_id", "route_id"]]
+
+@st.cache_data(show_spinner=False)
+def load_stop_times(gtfs_dir: str) -> pd.DataFrame:
+    p = Path(gtfs_dir) / "stop_times.txt"
+    # 必要列のみ。stop_sequence は int にして並び替え
+    df = pd.read_csv(p, dtype={"trip_id": str, "stop_id": str})
+    if "stop_sequence" in df.columns:
+        df["stop_sequence"] = pd.to_numeric(df["stop_sequence"], errors="coerce").astype("Int64")
+    else:
+        # 念のため時刻で代用（順序が担保できればOK）
+        df["stop_sequence"] = np.arange(len(df))
+    return df[["trip_id", "stop_id", "stop_sequence"]]
+
+@st.cache_data(show_spinner=False)
 def load_routes(gtfs_dir: str) -> pd.DataFrame:
     # Path型に合わせて結合（strでも動くがPathの方が安全）
     routes_path = (Path(gtfs_dir) / "routes.txt")
     return pd.read_csv(routes_path, dtype={'route_id': str})
+
+@st.cache_data(show_spinner=False)
+def make_route_display_map(gtfs_dir: str) -> dict[str, str]:
+    """routes.txt から route_id → 表示名 の辞書を作る"""
+    df = load_routes(gtfs_dir).copy()
+    # 列が無い GTFS にも耐える
+    long = df["route_long_name"] if "route_long_name" in df.columns else pd.Series([""]*len(df))
+    short = df["route_short_name"] if "route_short_name" in df.columns else pd.Series([""]*len(df))
+    long = long.fillna("").astype(str).str.strip()
+    short = short.fillna("").astype(str).str.strip()
+
+    def compose(row):
+        l, s, rid = row["long"], row["short"], row["route_id"]
+        if l and s: return f"{l} ({s})"
+        if l:       return l
+        if s:       return s
+        return str(rid)
+
+    tmp = pd.DataFrame({"route_id": df["route_id"].astype(str), "long": long, "short": short})
+    tmp["display_name"] = tmp.apply(compose, axis=1)
+    return tmp.set_index("route_id")["display_name"].to_dict()
 
 # --- Stops Loading ---
 @st.cache_data(show_spinner=False)
@@ -65,6 +103,63 @@ def to_stops_payload(df: pd.DataFrame) -> list[dict]:
         {"stop_id": r.stop_id, "name": str(r.stop_name), "coord": [float(r.lon), float(r.lat)]}
         for r in df.itertuples(index=False)
     ]
+
+@st.cache_data(show_spinner=False)
+def build_unique_edges(
+    gtfs_dir: str,
+    selected_route_ids: list[str],
+    stops_df: pd.DataFrame
+) -> list[dict]:
+    # ✅ display_name はここで作る
+    route_names_map = make_route_display_map(gtfs_dir)
+
+    """選択路線に含まれる trip だけから、停留所ペア（無向）をユニーク化して返す。"""
+    trips = load_trips(gtfs_dir)
+    stimes = load_stop_times(gtfs_dir)
+
+    # 選択路線の trip のみに限定
+    trips_sel = trips[trips["route_id"].isin(selected_route_ids)]
+    st_sel = stimes.merge(trips_sel, on="trip_id", how="inner")
+
+    # trip 内で stop_sequence 順に並べて隣接ペアを作る
+    st_sel = st_sel.sort_values(["trip_id", "stop_sequence"])
+    st_sel["next_stop_id"] = st_sel.groupby("trip_id")["stop_id"].shift(-1)
+    pairs = st_sel.dropna(subset=["next_stop_id"]).copy()
+    pairs["a"] = pairs["stop_id"].astype(str)
+    pairs["b"] = pairs["next_stop_id"].astype(str)
+
+    # 無向化（A,B をソートして同一視）
+    ab_min = pairs[["a","b"]].min(axis=1)
+    ab_max = pairs[["a","b"]].max(axis=1)
+    pairs["edge_key"] = ab_min + "|" + ab_max
+
+    # edge_key ごとに route_id の集合と出現回数を集計
+    agg = pairs.groupby("edge_key").agg(
+        a=("a", "first"),  # 代表（見た目にはどちらでも良い）
+        b=("b", "first"),
+        routes=("route_id", lambda s: tuple(sorted(set(s)))),
+        trips_count=("trip_id", "nunique"),
+    ).reset_index(drop=True)
+
+    # 停留所座標を引き当て（事前に丸め済みの lat/lon を使う）
+    stop_map = stops_df.set_index("stop_id")[["lat", "lon", "stop_name"]].to_dict("index")
+
+    edges_payload = []
+    for r in agg.itertuples(index=False):
+        if r.a not in stop_map or r.b not in stop_map:
+            continue
+        a_info = stop_map[r.a]
+        b_info = stop_map[r.b]
+        edges_payload.append({
+            "path": [[float(a_info["lon"]), float(a_info["lat"])],
+                     [float(b_info["lon"]), float(b_info["lat"])]],
+            "routes": list(r.routes),                # この線分を走る route_id 群
+            "a_name": str(a_info["stop_name"]),
+            "b_name": str(b_info["stop_name"]),
+            "trips_count": int(r.trips_count),        # どのくらい使われているか（ツールチップ用）
+            "route_names": [route_names_map.get(str(rid), str(rid)) for rid in r.routes]
+        })
+    return edges_payload
 
 
 def thin_by_time(df: pd.DataFrame, step_sec: int) -> pd.DataFrame:
@@ -118,9 +213,11 @@ def to_trips_payload(df: pd.DataFrame, route_colors: dict[str, list[int]]) -> li
 def render_trips_in_browser(
     trips_data, routes_ui, view_state, map_style,
     min_ts, max_ts, step, trail_length=120, fps=24,
-    stops_data=None, show_labels=False, stop_size_px=6
+    stops_data=None, show_labels=False, stop_size_px=6,
+    edges_data=None, show_edges=True, line_width_px=3
 ):
     stops_data = stops_data or []
+    edges_data = edges_data or []
     html_tmpl = Template(r"""
     <div id="map-wrap" style="position:relative;height:80vh;width:100%;">
       <div id="deck-container" style="position:absolute;inset:0;"></div>
@@ -139,6 +236,7 @@ def render_trips_in_browser(
       const trips = $TRIPS;     // [{trip_id, route_id, path, timestamps, color}]
       const routes = $ROUTES;   // [{route_id, name, color}]
       const stops  = $STOPS;    // [{stop_id, name, coord:[lon,lat]}]
+      const edges  = $EDGES;          // ← 追加: 停留所間ライン
       const initialViewState = $VIEW;
 
       const MIN_TS = $MIN_TS;
@@ -149,6 +247,9 @@ def render_trips_in_browser(
 
       const SHOW_LABELS = $SHOW_LABELS;
       const STOP_SIZE   = $STOP_SIZE;
+
+      const SHOW_EDGES = $SHOW_EDGES; // ← 追加
+      const LINE_WIDTH = $LINE_WIDTH; // ← 追加
 
       const deckgl = new deck.DeckGL({
         container: 'deck-container',
@@ -165,6 +266,10 @@ def render_trips_in_browser(
           if (layer.id === 'trips') {
             return {text: "route: " + object.route_id};
           }
+          if (layer.id === 'route-edges') {
+            const names = (object.route_names || object.routes || []).join(", ");
+            return {text: object.a_name + " ↔ " + object.b_name + "\n路線: " + names};
+          }
           return null;
         }
       });
@@ -174,6 +279,7 @@ def render_trips_in_browser(
       let currentTime = MIN_TS;
 
       function makeLayers(ct, visibleTrips) {
+        const routeColorMap = Object.fromEntries(routes.map(r => [String(r.route_id), r.color]));
         const layers = [];
 
         layers.push(new deck.TripsLayer({
@@ -230,6 +336,34 @@ def render_trips_in_browser(
           }));
         }
 
+        // 停留所間ライン（無向ペアの重複は Python 側で排除済）
+        if (SHOW_EDGES && edges.length > 0) {
+          // フィルタ：有効な路線（enabled）を1つ以上含むエッジのみ
+          const visibleEdges = edges.filter(e => e.routes.some(rid => enabled.has(String(rid))));
+
+          // 色決定：そのエッジで "enabled な最初の route_id" の色を使う（軌跡色と一致）
+          const pickColor = (routesOfEdge) => {
+            for (const rid of routesOfEdge) {
+              const k = String(rid);
+              if (enabled.has(k) && routeColorMap[k]) return routeColorMap[k];
+            }
+            // 予備：全て無効なら先頭の色かデフォルト
+            const k0 = String(routesOfEdge[0] || "");
+            return routeColorMap[k0] || [80,80,80];
+          };
+
+          layers.push(new deck.PathLayer({
+            id: 'route-edges',
+            data: visibleEdges,
+            getPath: d => d.path,
+            getColor: d => pickColor(d.routes),
+            widthUnits: 'pixels',
+            getWidth: d => LINE_WIDTH,
+            parameters: { depthTest: false },
+            pickable: true
+          }));
+        }
+
         return layers;
       }
 
@@ -260,11 +394,14 @@ def render_trips_in_browser(
         TRIPS=json.dumps(trips_data, separators=(',', ':')),
         ROUTES=json.dumps(routes_ui, separators=(',', ':')),
         STOPS=json.dumps(stops_data, separators=(',', ':')),
+        EDGES=json.dumps(edges_data, separators=(',', ':')),   # ← 追加
         VIEW=json.dumps(view_state, separators=(',', ':')),
         MIN_TS=min_ts, MAX_TS=max_ts, STEP=step, FPS=fps, TRAIL=trail_length,
         MAP_STYLE=map_style,
         SHOW_LABELS=json.dumps(bool(show_labels)),
         STOP_SIZE=int(stop_size_px),
+        SHOW_EDGES=json.dumps(bool(show_edges)),               # ← 追加
+        LINE_WIDTH=int(line_width_px),                         # ← 追加
     )
     components.html(html, height=720)
 
@@ -276,24 +413,14 @@ def main() -> None:
 
     # --- Path and Date Setup ---
     script_dir = Path(__file__).parent
-
-    # まずは Windows 絶対パスを優先（raw 文字列にしておく）
-    abs_gtfs_dir = Path(r"C:\Users\Owner\Desktop\workspace_new\proj_j_bus-timelapse-theater\data\AllLines-20250703")
-
-    candidates = [
-        abs_gtfs_dir,
-        script_dir / "data" / "gtfs" / "2025-07-03",
+    gtfs_candidates = [
+        script_dir / "data" / "gtfs" / "2025-07-03", # 相対パス優先 (gtfs/2025-07-03 を優先)
+        script_dir / "data" / "AllLines-20250703",
+        Path(r"C:\Users\Owner\Desktop\workspace_new\proj_j_bus-timelapse-theater\data\AllLines-20250703"),  # フォールバック
     ]
-
-    gtfs_dir = None
-    for p in candidates:
-        if (p / "stops.txt").exists() and (p / "routes.txt").exists():
-            gtfs_dir = p
-            break
-
+    gtfs_dir = next((p for p in gtfs_candidates if (p / "stops.txt").exists() and (p / "routes.txt").exists()), None)
     if gtfs_dir is None:
-        st.error("GTFS データ（stops.txt, routes.txt）が見つかりません。パス設定を確認してください。")
-        st.stop()
+        st.error("GTFS データが見つかりません。data/AllLines-20250703 を配置してください。"); st.stop()
 
     fixed_date_str = "2025-07-15"
 
@@ -313,6 +440,11 @@ def main() -> None:
     show_labels = st.sidebar.checkbox("バス停名ラベルを表示（高ズーム推奨）", value=False)
     stop_size_px = st.sidebar.slider("バス停サイズ（px）", min_value=3, max_value=12, value=6)
 
+    # 路線ライン表示
+    st.sidebar.subheader("路線ライン")
+    show_edges = st.sidebar.checkbox("停留所間ラインを表示", value=True)
+    line_width_px = st.sidebar.slider("ライン太さ（px）", 1, 8, 3)
+
 
     # --- Data Loading ---
     with st.spinner(f"{fixed_date_str} のキャッシュデータを生成・読込中..."):
@@ -323,9 +455,7 @@ def main() -> None:
         st.stop()
 
     # ルート情報は既存のまま
-    routes_df = load_routes(gtfs_dir)
-    routes_df['display_name'] = routes_df['route_long_name'].fillna('') + " (" + routes_df['route_short_name'].fillna('') + ")"
-    route_options = routes_df.set_index('route_id')['display_name'].to_dict()
+    route_options = make_route_display_map(gtfs_dir)  # route_id -> display_name
     all_route_ids = list(route_options.keys())
 
     # （前回提案の全選択/全解除 UI はそのまま利用）
@@ -364,6 +494,13 @@ def main() -> None:
     if show_stops:
         stops_df = load_stops(gtfs_dir)
         stops_data = to_stops_payload(stops_df)
+
+    edges_data = []
+    if show_edges:
+        # stops_df は既に読み込まれている可能性があるので、再読込は不要
+        if 'stops_df' not in locals(): # stops_df がローカル変数にない場合のみ読み込む
+            stops_df = load_stops(gtfs_dir)
+        edges_data = build_unique_edges(gtfs_dir, selected_route_ids, stops_df)
 
 
     # --- Apply Filters and Process Data ---
@@ -427,9 +564,12 @@ def main() -> None:
         step=speed_option,
         trail_length=trail_length_tuned,
         fps=24,
-        stops_data=stops_data,          # ← 追加
-        show_labels=show_labels,        # ← 追加
-        stop_size_px=stop_size_px       # ← 追加
+        stops_data=stops_data,
+        show_labels=show_labels,
+        stop_size_px=stop_size_px,
+        edges_data=edges_data,           # ← 追加
+        show_edges=show_edges,           # ← 追加
+        line_width_px=line_width_px      # ← 追加
     )
 
 if __name__ == "__main__":
