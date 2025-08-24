@@ -222,6 +222,22 @@ def render_trips_in_browser(
     html_tmpl = Template(r"""
     <div id="map-wrap" style="position:relative;height:80vh;width:100%;">
       <div id="deck-container" style="position:absolute;inset:0;"></div>
+      
+      <!-- 時計表示用の要素を追加 -->
+      <div id="clock-display" style="
+        position: absolute;
+        top: 20px;
+        right: 20px;
+        background: rgba(0,0,0,0.7);
+        color: white;
+        padding: 10px 15px;
+        border-radius: 5px;
+        font-family: 'Noto Sans JP', sans-serif;
+        font-size: 24px;
+        font-weight: bold;
+        z-index: 10;
+      "></div>
+
     </div>
 
     <!-- 日本語フォントを iframe 側に読み込む（重要）-->
@@ -281,6 +297,19 @@ def render_trips_in_browser(
       // 状態：有効化された route_id 集合（初期は全ON）
       let enabled = new Set(routes.map(r => r.route_id));
       let currentTime = MIN_TS;
+      const clockElement = document.getElementById('clock-display');
+
+      // 時計を更新する関数
+      function updateClock(time) {
+        if (!clockElement) return;
+        // Unixtime (秒) を HH:MM:SS 形式に変換
+        const date = new Date(time * 1000);
+        // タイムゾーンを考慮しないUTCでの時刻を取得
+        const h = String(date.getUTCHours()).padStart(2, '0');
+        const m = String(date.getUTCMinutes()).padStart(2, '0');
+        const s = String(date.getUTCSeconds()).padStart(2, '0');
+        clockElement.innerText = `${h}:${m}:${s}`;
+      }
 
       function makeLayers(ct, visibleTrips) {
         const routeColorMap = Object.fromEntries(routes.map(r => [String(r.route_id), r.color]));
@@ -373,6 +402,7 @@ def render_trips_in_browser(
       }
 
       // 初期描画
+      updateClock(currentTime);
       updateVisibleTrips();
 
       // フォント読込完了後にレイヤを再設定
@@ -384,6 +414,7 @@ def render_trips_in_browser(
       function tick() {
         currentTime += STEP;
         if (currentTime > MAX_TS) currentTime = MIN_TS;
+        updateClock(currentTime);
         updateVisibleTrips();
       }
       setInterval(tick, Math.max(1, Math.floor(1000 / FPS)));
@@ -407,6 +438,7 @@ def render_trips_in_browser(
         EDGE_ALPHA=int(edge_opacity),         # ← 追加
     )
     components.html(html, height=720)
+
 
 
 def main() -> None:
