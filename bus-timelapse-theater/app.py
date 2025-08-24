@@ -32,6 +32,19 @@ import streamlit.components.v1 as components
 
 from modules.path_builder import build_day_cache
 
+# --- Constants ---
+POPULATION_COLUMNS = {
+    "PTN_2025": "2025年 男女計総数",
+    "PTN_2030": "2030年 男女計総数",
+    "PTN_2035": "2035年 男女計総数",
+    "PTN_2040": "2040年 男女計総数",
+    "PTN_2045": "2045年 男女計総数",
+    "PTN_2050": "2050年 男女計総数",
+    "PTN_2055": "2055年 男女計総数",
+    "PTN_2060": "2060年 男女計総数",
+    "PTN_2065": "2065年 男女計総数",
+    "PTN_2070": "2070年 男女計総数",
+}
 
 # --- Data Loading and Caching ---
 
@@ -40,7 +53,7 @@ def _load_cache(date_str: str, gtfs_dir: str) -> pd.DataFrame:
     """Load a bus position cache from disk, building it if necessary."""
     return build_day_cache(date_str, gtfs_dir=str(gtfs_dir))
 
-@st.cache_data(show_spinner="Loading population mesh...")
+@st.cache_data(show_spinner=False)
 def load_geojson_data(path: str) -> dict:
     """Loads GeoJSON data from a file."""
     with open(path, "r", encoding="utf-8") as f:
@@ -116,10 +129,10 @@ def build_unique_edges(
     selected_route_ids: list[str],
     stops_df: pd.DataFrame
 ) -> list[dict]:
+    """選択路線に含まれる trip だけから、停留所ペア（無向）をユニーク化して返す。"""
     # ✅ display_name はここで作る
     route_names_map = make_route_display_map(gtfs_dir)
 
-    """選択路線に含まれる trip だけから、停留所ペア（無向）をユニーク化して返す。"""
     trips = load_trips(gtfs_dir)
     stimes = load_stop_times(gtfs_dir)
 
@@ -225,7 +238,7 @@ def render_trips_in_browser(
     stops_data=None, show_labels=False, stop_size_px=6,
     edges_data=None, show_edges=True, line_width_px=3,
     trip_width_px=4, trail_opacity=220, edge_opacity=140,
-    mesh_data=None, show_mesh=False
+    mesh_data=None, show_mesh=False, selected_pop_column='PTN_2025'
 ):
     stops_data = stops_data or []
     edges_data = edges_data or []
@@ -262,6 +275,7 @@ def render_trips_in_browser(
       const TRAIL_ALPHA = $TRAIL_ALPHA;
       const EDGE_ALPHA  = $EDGE_ALPHA;
       const SHOW_MESH = $SHOW_MESH;
+      const POP_COLUMN = '$SELECTED_POP_COLUMN';
 
       const deckgl = new deck.DeckGL({
         container: 'deck-container',
@@ -278,8 +292,7 @@ def render_trips_in_browser(
             return {text: object.a_name + " ↔ " + object.b_name + "\n路線: " + names};
           }
           if (layer.id === 'population-mesh') {
-            // 推計人口のプロパティ名を仮定 (PTN_2025)。実際のプロパティに合わせて要修正
-            const pop = object.properties.PTN_2025 || object.properties.population || 0;
+            const pop = object.properties[POP_COLUMN] || 0;
             return {text: `推計人口: ${pop}人`};
           }
           return null;
@@ -313,8 +326,7 @@ def render_trips_in_browser(
                 filled: true,
                 extruded: false,
                 getFillColor: f => {
-                    // 人口プロパティを仮定 (PTN_2025)。データに合わせて要修正
-                    const pop = f.properties.PTN_2025 || 0;
+                    const pop = f.properties[POP_COLUMN] || 0;
                     if (pop > 100) return [255, 0, 0, 80];
                     if (pop > 50)  return [255, 140, 0, 80];
                     if (pop > 20)  return [255, 255, 0, 80];
@@ -409,6 +421,7 @@ def render_trips_in_browser(
         TRAIL_ALPHA=int(trail_opacity),
         EDGE_ALPHA=int(edge_opacity),
         SHOW_MESH=json.dumps(bool(show_mesh)),
+        SELECTED_POP_COLUMN=selected_pop_column
     )
     components.html(html, height=720)
 
@@ -439,13 +452,17 @@ def main() -> None:
 
     st.sidebar.subheader("メッシュ表示")
     show_mesh = st.sidebar.checkbox("人口メッシュを表示", value=False)
+    selected_pop_column = 'PTN_2025'  # Default value
     if show_mesh:
+        selected_pop_label = st.sidebar.selectbox(
+            label="表示する推計人口データを選択",
+            options=list(POPULATION_COLUMNS.values()),
+            index=0
+        )
+        selected_pop_column = next((k for k, v in POPULATION_COLUMNS.items() if v == selected_pop_label), 'PTN_2025')
+        
         st.sidebar.caption(
             """
-            **表示データ:** 2025年男女計総数人口（秘匿なし）
-            
-            ---
-            
             250mメッシュ別将来推計人口（令和2年国勢調査準拠）。
             **出典:** 国土交通省国土政策局「国土数値情報」
             **ライセンス:** [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/deed.ja)
@@ -473,16 +490,20 @@ def main() -> None:
 
     mesh_data = None
     if show_mesh:
-        mesh_path = Path(r"C:\Users\Owner\Desktop\workspace_new\proj_j_bus-timelapse-theater\data\国土数値情報_将来推計人口250m_mesh_2024_38_GEOJSON\250m_mesh_2024_38_processed.geojson")
-        if mesh_path.exists():
+        mesh_candidates = [
+            Path(__file__).parent.parent / "data" / "国土数値情報_将来推計人口250m_mesh_2024_38_GEOJSON" / "250m_mesh_2024_38_processed.geojson",
+            Path(r"C:\Users\Owner\Desktop\workspace_new\proj_j_bus-timelapse-theater\data\国土数値情報_将来推計人口250m_mesh_2024_38_GEOJSON\250m_mesh_2024_38_processed.geojson"),
+        ]
+        mesh_path = next((p for p in mesh_candidates if p.exists()), None)
+
+        if mesh_path:
             mesh_data = load_geojson_data(str(mesh_path))
         else:
-            st.warning(f"人口メッシュファイルが見つかりません: {mesh_path}")
+            st.warning("人口メッシュファイルが見つかりません。")
 
 
     if df.empty:
-        st.warning("選択した日に運行するサービスはありません。")
-        st.stop()
+        st.warning("選択した日に運行するサービスはありません。"); st.stop()
 
     route_options = make_route_display_map(gtfs_dir)
     all_route_ids = list(route_options.keys())
@@ -520,14 +541,12 @@ def main() -> None:
         edges_data = build_unique_edges(gtfs_dir, selected_route_ids, stops_df)
 
     if not selected_route_ids:
-        st.warning("路線を1つ以上選択してください。")
-        st.stop()
+        st.warning("路線を1つ以上選択してください。"); st.stop()
 
     filtered_df = df[df['route_id'].isin(selected_route_ids)]
 
     if filtered_df.empty:
-        st.warning("選択された路線は、この日に運行データがありません。")
-        st.stop()
+        st.warning("選択された路線は、この日に運行データがありません。"); st.stop()
 
     st.success(f"{fixed_date_str} の {len(selected_route_ids)} 路線を読み込みました。(軌跡データ: {len(filtered_df):,}行)")
 
@@ -551,8 +570,7 @@ def main() -> None:
         lat_center, lon_center = float(processed_df["lat"].mean()), float(processed_df["lon"].mean())
         min_ts, max_ts = int(processed_df["timestamp"].min()), int(processed_df["timestamp"].max())
     else:
-        st.warning("処理されたデータがありません。")
-        st.stop()
+        st.warning("処理されたデータがありません。"); st.stop()
 
     view_state = dict(latitude=lat_center, longitude=lon_center, zoom=12, pitch=45, bearing=0)
     map_style = (
@@ -582,7 +600,8 @@ def main() -> None:
         trail_opacity=trail_opacity,
         edge_opacity=edge_opacity,
         mesh_data=mesh_data,
-        show_mesh=show_mesh
+        show_mesh=show_mesh,
+        selected_pop_column=selected_pop_column
     )
 
 if __name__ == "__main__":
