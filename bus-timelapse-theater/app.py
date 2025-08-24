@@ -40,6 +40,12 @@ def _load_cache(date_str: str, gtfs_dir: str) -> pd.DataFrame:
     """Load a bus position cache from disk, building it if necessary."""
     return build_day_cache(date_str, gtfs_dir=str(gtfs_dir))
 
+@st.cache_data(show_spinner="Loading population mesh...")
+def load_geojson_data(path: str) -> dict:
+    """Loads GeoJSON data from a file."""
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
 @st.cache_data(show_spinner=False)
 def load_trips(gtfs_dir: str) -> pd.DataFrame:
     p = Path(gtfs_dir) / "trips.txt"
@@ -68,8 +74,8 @@ def make_route_display_map(gtfs_dir: str) -> dict[str, str]:
     """routes.txt から route_id → 表示名 の辞書を作る"""
     df = load_routes(gtfs_dir).copy()
     # 列が無い GTFS にも耐える
-    long = df["route_long_name"] if "route_long_name" in df.columns else pd.Series([""]*len(df))
-    short = df["route_short_name"] if "route_short_name" in df.columns else pd.Series([""]*len(df))
+    long = df["route_long_name"] if "route_long_name" in df.columns else pd.Series(["" ]*len(df))
+    short = df["route_short_name"] if "route_short_name" in df.columns else pd.Series(["" ]*len(df))
     long = long.fillna("").astype(str).str.strip()
     short = short.fillna("").astype(str).str.strip()
 
@@ -152,7 +158,7 @@ def build_unique_edges(
         b_info = stop_map[r.b]
         edges_payload.append({
             "path": [[float(a_info["lon"]), float(a_info["lat"])],
-                     [float(b_info["lon"]), float(b_info["lat"])]],
+                     [float(b_info["lon"]), float(b_info["lat"]) ]],
             "routes": list(r.routes),                # この線分を走る route_id 群
             "a_name": str(a_info["stop_name"]),
             "b_name": str(b_info["stop_name"]),
@@ -211,49 +217,35 @@ def to_trips_payload(df: pd.DataFrame, route_colors: dict[str, list[int]]) -> li
     return trips
 
 def render_trips_in_browser(
-    trips_data, routes_ui, view_state, map_style,
+    trips_data,
+    routes_ui,
+    view_state,
+    map_style,
     min_ts, max_ts, step, trail_length=120, fps=24,
     stops_data=None, show_labels=False, stop_size_px=6,
     edges_data=None, show_edges=True, line_width_px=3,
-    trip_width_px=4, trail_opacity=220, edge_opacity=140
+    trip_width_px=4, trail_opacity=220, edge_opacity=140,
+    mesh_data=None, show_mesh=False
 ):
     stops_data = stops_data or []
     edges_data = edges_data or []
+    mesh_data = mesh_data or {"type": "FeatureCollection", "features": []}
+
     html_tmpl = Template(r"""
     <div id="map-wrap" style="position:relative;height:80vh;width:100%;">
       <div id="deck-container" style="position:absolute;inset:0;"></div>
-      
-      <!-- 時計表示用の要素を追加 -->
-      <div id="clock-display" style="
-        position: absolute;
-        top: 20px;
-        right: 20px;
-        background: rgba(0,0,0,0.7);
-        color: white;
-        padding: 10px 15px;
-        border-radius: 5px;
-        font-family: 'Noto Sans JP', sans-serif;
-        font-size: 24px;
-        font-weight: bold;
-        z-index: 10;
-      "></div>
-
+      <div id="clock-display" style="position: absolute; top: 20px; right: 20px; background: rgba(0,0,0,0.7); color: white; padding: 10px 15px; border-radius: 5px; font-family: 'Noto Sans JP', sans-serif; font-size: 24px; font-weight: bold; z-index: 10;"></div>
     </div>
-
-    <!-- 日本語フォントを iframe 側に読み込む（重要）-->
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;700&display=swap" rel="stylesheet">
-
-    <!-- ✅ 空白を削除した正しい CDN URL -->
     <script src="https://unpkg.com/deck.gl@8.9.27/dist.min.js"></script>
     <script src="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.js"></script>
     <link href="https://unpkg.com/maplibre-gl@2.4.0/dist/maplibre-gl.css" rel="stylesheet"/>
-
     <script>
-      // データ
-      const trips = $TRIPS;     // [{trip_id, route_id, path, timestamps, color}]
-      const routes = $ROUTES;   // [{route_id, name, color}]
-      const stops  = $STOPS;    // [{stop_id, name, coord:[lon,lat]}]
-      const edges  = $EDGES;          // ← 追加: 停留所間ライン
+      const trips = $TRIPS;
+      const routes = $ROUTES;
+      const stops  = $STOPS;
+      const edges  = $EDGES;
+      const meshData = $MESH_DATA;
       const initialViewState = $VIEW;
 
       const MIN_TS = $MIN_TS;
@@ -264,12 +256,12 @@ def render_trips_in_browser(
 
       const SHOW_LABELS = $SHOW_LABELS;
       const STOP_SIZE   = $STOP_SIZE;
-
       const SHOW_EDGES = $SHOW_EDGES;
       const LINE_WIDTH = $LINE_WIDTH;
-      const TRIP_WIDTH = $TRIP_WIDTH;     // ← 追加
-      const TRAIL_ALPHA = $TRAIL_ALPHA;   // ← 追加
-      const EDGE_ALPHA  = $EDGE_ALPHA;    // ← 追加
+      const TRIP_WIDTH = $TRIP_WIDTH;
+      const TRAIL_ALPHA = $TRAIL_ALPHA;
+      const EDGE_ALPHA  = $EDGE_ALPHA;
+      const SHOW_MESH = $SHOW_MESH;
 
       const deckgl = new deck.DeckGL({
         container: 'deck-container',
@@ -279,32 +271,28 @@ def render_trips_in_browser(
         mapStyle: "$MAP_STYLE",
         getTooltip: ({object, layer}) => {
           if (!object || !layer) return null;
-          if (layer.id === 'stops') {
-            // ✅ Template と衝突しない通常の連結
-            return {text: object.name + " (" + object.stop_id + ")"};
-          }
-          if (layer.id === 'trips') {
-            return {text: "route: " + object.route_id};
-          }
+          if (layer.id === 'stops') return {text: object.name + " (" + object.stop_id + ")"};
+          if (layer.id === 'trips') return {text: "route: " + object.route_id};
           if (layer.id === 'route-edges') {
             const names = (object.route_names || object.routes || []).join(", ");
             return {text: object.a_name + " ↔ " + object.b_name + "\n路線: " + names};
+          }
+          if (layer.id === 'population-mesh') {
+            // 推計人口のプロパティ名を仮定 (PTN_2025)。実際のプロパティに合わせて要修正
+            const pop = object.properties.PTN_2025 || object.properties.population || 0;
+            return {text: `推計人口: ${pop}人`};
           }
           return null;
         }
       });
 
-      // 状態：有効化された route_id 集合（初期は全ON）
       let enabled = new Set(routes.map(r => r.route_id));
       let currentTime = MIN_TS;
       const clockElement = document.getElementById('clock-display');
 
-      // 時計を更新する関数
       function updateClock(time) {
         if (!clockElement) return;
-        // Unixtime (秒) を HH:MM:SS 形式に変換
         const date = new Date(time * 1000);
-        // タイムゾーンを考慮しないUTCでの時刻を取得
         const h = String(date.getUTCHours()).padStart(2, '0');
         const m = String(date.getUTCMinutes()).padStart(2, '0');
         const s = String(date.getUTCSeconds()).padStart(2, '0');
@@ -316,7 +304,26 @@ def render_trips_in_browser(
         const addAlpha = (rgb, a) => (rgb && rgb.length >= 3) ? [rgb[0], rgb[1], rgb[2], a] : [80,80,80,a];
         const layers = [];
 
-        // --- 1) 停留所間ライン：下敷きに描画 ---
+        if (SHOW_MESH && meshData && meshData.features) {
+            layers.push(new deck.GeoJsonLayer({
+                id: 'population-mesh',
+                data: meshData,
+                pickable: true,
+                stroked: false,
+                filled: true,
+                extruded: false,
+                getFillColor: f => {
+                    // 人口プロパティを仮定 (PTN_2025)。データに合わせて要修正
+                    const pop = f.properties.PTN_2025 || 0;
+                    if (pop > 100) return [255, 0, 0, 80];
+                    if (pop > 50)  return [255, 140, 0, 80];
+                    if (pop > 20)  return [255, 255, 0, 80];
+                    if (pop > 0)   return [0, 255, 0, 80];
+                    return [0, 0, 0, 0]; // 人口0は透明
+                },
+            }));
+        }
+
         if (SHOW_EDGES && edges.length > 0) {
           const visibleEdges = edges.filter(e => e.routes.some(rid => enabled.has(String(rid))));
           const pickColor = (routesOfEdge) => {
@@ -328,71 +335,38 @@ def render_trips_in_browser(
             return addAlpha(routeColorMap[k0] || [80,80,80], EDGE_ALPHA);
           };
           layers.push(new deck.PathLayer({
-            id: 'route-edges',
-            data: visibleEdges,
-            getPath: d => d.path,
-            getColor: d => pickColor(d.routes),
-            widthUnits: 'pixels',
-            getWidth: d => LINE_WIDTH,
-            parameters: { depthTest: false },
-            pickable: true
+            id: 'route-edges', data: visibleEdges, getPath: d => d.path,
+            getColor: d => pickColor(d.routes), widthUnits: 'pixels', getWidth: d => LINE_WIDTH,
+            parameters: { depthTest: false }, pickable: true
           }));
         }
 
-        // --- 2) バス軌跡（アニメーション）：上に描画 ---
         layers.push(new deck.TripsLayer({
-          id: 'trips',
-          data: visibleTrips,
-          getPath: d => d.path,
-          getTimestamps: d => d.timestamps,
-          getColor: d => addAlpha(d.color, TRAIL_ALPHA),
-          widthMinPixels: TRIP_WIDTH,     // ← 太さをスライダで
-          trailLength: TRAIL,
-          currentTime: ct,
-          pickable: true
+          id: 'trips', data: visibleTrips, getPath: d => d.path, getTimestamps: d => d.timestamps,
+          getColor: d => addAlpha(d.color, TRAIL_ALPHA), widthMinPixels: TRIP_WIDTH,
+          trailLength: TRAIL, currentTime: ct, pickable: true
         }));
 
-        // --- 3) 停留所ポイント ---
         if (stops.length > 0) {
           layers.push(new deck.ScatterplotLayer({
-            id: 'stops',
-            data: stops,
-            getPosition: d => d.coord,
-            getRadius: d => 1,
-            radiusMinPixels: STOP_SIZE,
-            radiusMaxPixels: STOP_SIZE,
-            stroked: true,
-            filled: true,
-            getFillColor: [0, 0, 0, 200],
-            getLineColor: [255, 255, 255, 220],
-            lineWidthMinPixels: 1,
-            pickable: true
+            id: 'stops', data: stops, getPosition: d => d.coord, getRadius: d => 1,
+            radiusMinPixels: STOP_SIZE, radiusMaxPixels: STOP_SIZE, stroked: true, filled: true,
+            getFillColor: [0, 0, 0, 200], getLineColor: [255, 255, 255, 220],
+            lineWidthMinPixels: 1, pickable: true
           }));
         }
 
         if (SHOW_LABELS && stops.length > 0) {
           const CHARSET = Array.from(new Set(stops.map(d => d.name).join('')));
           layers.push(new deck.TextLayer({
-            id: 'stop-labels',
-            data: stops,
-            getPosition: d => d.coord,
-            getText: d => d.name,
-            getSize: d => 14,
-            sizeUnits: 'pixels',
-            sizeScale: 1,
+            id: 'stop-labels', data: stops, getPosition: d => d.coord, getText: d => d.name,
+            getSize: d => 14, sizeUnits: 'pixels', sizeScale: 1,
             fontFamily: 'Noto Sans JP, "Yu Gothic UI", Meiryo, "Hiragino Kaku Gothic ProN", sans-serif',
-            characterSet: CHARSET,
-            background: true,
-            getBackgroundColor: [255,255,255,220],
-            getColor: [20, 20, 20, 255],
-            getTextAnchor: 'start',
-            getAlignmentBaseline: 'center',
-            billboard: true,
-            pickable: false,
-            parameters: { depthTest: false }
+            characterSet: CHARSET, background: true, getBackgroundColor: [255,255,255,220],
+            getColor: [20, 20, 20, 255], getTextAnchor: 'start', getAlignmentBaseline: 'center',
+            billboard: true, pickable: false, parameters: { depthTest: false }
           }));
         }
-
         return layers;
       }
 
@@ -401,16 +375,13 @@ def render_trips_in_browser(
         deckgl.setProps({ layers: makeLayers(currentTime, visibleTrips) });
       }
 
-      // 初期描画
       updateClock(currentTime);
       updateVisibleTrips();
 
-      // フォント読込完了後にレイヤを再設定
       if (document.fonts && document.fonts.ready) {
         document.fonts.ready.then(() => updateVisibleTrips());
       }
 
-      // アニメーション
       function tick() {
         currentTime += STEP;
         if (currentTime > MAX_TS) currentTime = MIN_TS;
@@ -426,6 +397,7 @@ def render_trips_in_browser(
         ROUTES=json.dumps(routes_ui, separators=(',', ':')),
         STOPS=json.dumps(stops_data, separators=(',', ':')),
         EDGES=json.dumps(edges_data, separators=(',', ':')),
+        MESH_DATA=json.dumps(mesh_data, separators=(',', ':')),
         VIEW=json.dumps(view_state, separators=(',', ':')),
         MIN_TS=min_ts, MAX_TS=max_ts, STEP=step, FPS=fps, TRAIL=trail_length,
         MAP_STYLE=map_style,
@@ -433,25 +405,23 @@ def render_trips_in_browser(
         STOP_SIZE=int(stop_size_px),
         SHOW_EDGES=json.dumps(bool(show_edges)),
         LINE_WIDTH=int(line_width_px),
-        TRIP_WIDTH=int(trip_width_px),        # ← 追加
-        TRAIL_ALPHA=int(trail_opacity),       # ← 追加
-        EDGE_ALPHA=int(edge_opacity),         # ← 追加
+        TRIP_WIDTH=int(trip_width_px),
+        TRAIL_ALPHA=int(trail_opacity),
+        EDGE_ALPHA=int(edge_opacity),
+        SHOW_MESH=json.dumps(bool(show_mesh)),
     )
     components.html(html, height=720)
 
 
-
 def main() -> None:
     st.set_page_config(layout="wide")
-    
     st.title("Ehime Bus Time‑Lapse Theater")
 
-    # --- Path and Date Setup ---
     script_dir = Path(__file__).parent
     gtfs_candidates = [
-        script_dir / "data" / "gtfs" / "2025-07-03", # 相対パス優先 (gtfs/2025-07-03 を優先)
+        script_dir / "data" / "gtfs" / "2025-07-03",
         script_dir / "data" / "AllLines-20250703",
-        Path(r"C:\Users\Owner\Desktop\workspace_new\proj_j_bus-timelapse-theater\data\AllLines-20250703"),  # フォールバック
+        Path(r"C:\Users\Owner\Desktop\workspace_new\proj_j_bus-timelapse-theater\data\AllLines-20250703"),
     ]
     gtfs_dir = next((p for p in gtfs_candidates if (p / "stops.txt").exists() and (p / "routes.txt").exists()), None)
     if gtfs_dir is None:
@@ -459,8 +429,6 @@ def main() -> None:
 
     fixed_date_str = "2025-07-15"
 
-
-    # --- Sidebar Controls ---
     st.sidebar.header("表示設定")
     st.sidebar.info(f"表示日付: {fixed_date_str}")
 
@@ -469,63 +437,69 @@ def main() -> None:
     )
     theme = st.sidebar.radio("地図テーマ", options=["Light", "Dark"], index=1)
 
-    # バス停表示の追加オプション
+    st.sidebar.subheader("メッシュ表示")
+    show_mesh = st.sidebar.checkbox("人口メッシュを表示", value=False)
+    if show_mesh:
+        st.sidebar.caption(
+            """
+            **表示データ:** 2025年男女計総数人口（秘匿なし）
+            
+            ---
+            
+            250mメッシュ別将来推計人口（令和2年国勢調査準拠）。
+            **出典:** 国土交通省国土政策局「国土数値情報」
+            **ライセンス:** [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/deed.ja)
+            """
+        )
+
     st.sidebar.subheader("バス停の表示")
     show_stops = st.sidebar.checkbox("バス停ポイントを表示", value=True)
     show_labels = st.sidebar.checkbox("バス停名ラベルを表示（高ズーム推奨）", value=False)
     stop_size_px = st.sidebar.slider("バス停サイズ（px）", min_value=3, max_value=12, value=6)
 
-    # 路線ライン表示
     st.sidebar.subheader("路線ライン")
     show_edges = st.sidebar.checkbox("停留所間ラインを表示", value=True)
     line_width_px = st.sidebar.slider("ライン太さ（px）", 1, 8, 3)
 
-    # バスの軌跡（TripsLayer）の太さ＆不透明度
     st.sidebar.subheader("バスの軌跡（アニメーション）")
     trip_width_px = st.sidebar.slider(
-        "軌跡の太さ（px）", 1, 16, max(line_width_px + 1, 4)  # ← ラインより常に少し太く
+        "軌跡の太さ（px）", 1, 16, max(line_width_px + 1, 4)
     )
     trail_opacity = st.sidebar.slider("軌跡の不透明度 (0-255)", 50, 255, 220)
-
-    # ラインの不透明度
     edge_opacity = st.sidebar.slider("ラインの不透明度 (0-255)", 20, 255, 140)
 
-
-    # --- Data Loading ---
     with st.spinner(f"{fixed_date_str} のキャッシュデータを生成・読込中..."):
         df = _load_cache(fixed_date_str, gtfs_dir)
+
+    mesh_data = None
+    if show_mesh:
+        mesh_path = Path(r"C:\Users\Owner\Desktop\workspace_new\proj_j_bus-timelapse-theater\data\国土数値情報_将来推計人口250m_mesh_2024_38_GEOJSON\250m_mesh_2024_38_processed.geojson")
+        if mesh_path.exists():
+            mesh_data = load_geojson_data(str(mesh_path))
+        else:
+            st.warning(f"人口メッシュファイルが見つかりません: {mesh_path}")
+
 
     if df.empty:
         st.warning("選択した日に運行するサービスはありません。")
         st.stop()
 
-    # ルート情報は既存のまま
-    route_options = make_route_display_map(gtfs_dir)  # route_id -> display_name
+    route_options = make_route_display_map(gtfs_dir)
     all_route_ids = list(route_options.keys())
 
-    # （前回提案の全選択/全解除 UI はそのまま利用）
-    # --- Route Selection ---
     route_keys = all_route_ids
-
-    # 初期選択を session_state で管理（既存デフォルトは '10025'）
     if "route_selector" not in st.session_state:
         st.session_state.route_selector = ['10025']
 
-    # 全選択 / 全解除 ボタン
     c1, c2, c3 = st.sidebar.columns([1,1,1])
-    with c1:
-        if st.button("全て選択", use_container_width=True):
-            st.session_state.route_selector = route_keys[:]   # 全部
-    with c2:
-        if st.button("全て解除", use_container_width=True):
-            st.session_state.route_selector = []              # 空
-    with c3:
-        # お好みで：反転（要らなければこの列ごと削除可）
-        if st.button("反転", use_container_width=True):
-            cur = set(st.session_state.route_selector)
-            st.session_state.route_selector = [k for k in route_keys if k not in cur]
+    if c1.button("全て選択", use_container_width=True):
+        st.session_state.route_selector = route_keys[:]
+    if c2.button("全て解除", use_container_width=True):
+        st.session_state.route_selector = []
+    if c3.button("反転", use_container_width=True):
+        cur = set(st.session_state.route_selector)
+        st.session_state.route_selector = [k for k in route_keys if k not in cur]
 
-    # multiselect は key で session_state と同期
     selected_route_ids = st.sidebar.multiselect(
         "表示する路線を選択",
         options=route_keys,
@@ -533,27 +507,22 @@ def main() -> None:
         key="route_selector"
     )
 
-
-    # バス停
     stops_data = []
-    if show_stops:
+    if show_stops or show_edges: # if we need edges, we need stops_df
         stops_df = load_stops(gtfs_dir)
-        stops_data = to_stops_payload(stops_df)
+        if show_stops:
+            stops_data = to_stops_payload(stops_df)
 
     edges_data = []
     if show_edges:
-        # stops_df は既に読み込まれている可能性があるので、再読込は不要
-        if 'stops_df' not in locals(): # stops_df がローカル変数にない場合のみ読み込む
+        if 'stops_df' not in locals():
             stops_df = load_stops(gtfs_dir)
         edges_data = build_unique_edges(gtfs_dir, selected_route_ids, stops_df)
 
-
-    # --- Apply Filters and Process Data ---
     if not selected_route_ids:
         st.warning("路線を1つ以上選択してください。")
         st.stop()
 
-    # 2) route filter
     filtered_df = df[df['route_id'].isin(selected_route_ids)]
 
     if filtered_df.empty:
@@ -562,18 +531,15 @@ def main() -> None:
 
     st.success(f"{fixed_date_str} の {len(selected_route_ids)} 路線を読み込みました。(軌跡データ: {len(filtered_df):,}行)")
 
-    # 3) 時間間引き＆近傍除去＆量子化
     processed_df = thin_by_time(filtered_df, step_sec=min(speed_option, 15))
     processed_df = drop_near_duplicates(processed_df, eps_m=3.0)
     processed_df["lat"] = processed_df["lat"].round(5)
     processed_df["lon"] = processed_df["lon"].round(5)
     processed_df["timestamp"] = processed_df["timestamp"].astype(np.int32)
 
-    # 4) Trips化（ルート別カラー割当）
     uniq_routes = list(pd.unique(processed_df["route_id"]))
     route_colors = {rid: PALETTE[i % len(PALETTE)] for i, rid in enumerate(uniq_routes)}
 
-    # 凡例/UI用メタ
     routes_ui = [
         {"route_id": rid, "name": route_options.get(rid, rid), "color": route_colors[rid]}
         for rid in uniq_routes
@@ -588,8 +554,6 @@ def main() -> None:
         st.warning("処理されたデータがありません。")
         st.stop()
 
-
-    # --- Deck.gl Rendering (Browser-side Animation) ---
     view_state = dict(latitude=lat_center, longitude=lon_center, zoom=12, pitch=45, bearing=0)
     map_style = (
         "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
@@ -597,8 +561,7 @@ def main() -> None:
         "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
     )
     
-    # レイヤ設定の実務的チューニング
-    trail_length_tuned = int(min(240, max(60, speed_option * 2))) # trail_length の上限を設定
+    trail_length_tuned = int(min(240, max(60, speed_option * 2)))
 
     render_trips_in_browser(
         trips_data=trips_data,
@@ -615,9 +578,11 @@ def main() -> None:
         edges_data=edges_data,
         show_edges=show_edges,
         line_width_px=line_width_px,
-        trip_width_px=trip_width_px,        # ← 追加
-        trail_opacity=trail_opacity,        # ← 追加
-        edge_opacity=edge_opacity           # ← 追加
+        trip_width_px=trip_width_px,
+        trail_opacity=trail_opacity,
+        edge_opacity=edge_opacity,
+        mesh_data=mesh_data,
+        show_mesh=show_mesh
     )
 
 if __name__ == "__main__":
